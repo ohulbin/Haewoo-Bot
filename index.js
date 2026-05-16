@@ -156,11 +156,20 @@ app.post('/webhook', async (req, res) => {
 
   if (event.event === 'send') {
     const userMessage = event.textContent.text; 
+    const inputType = event.textContent.inputType; // ⭐️ 추가: 입력 방식 추출
     const userHash = event.user;
 
+    // ⭐️ 1. 톡톡챗봇 버튼 클릭 시 AI 무시 (네이버 기본 챗봇이 응대)
+    if (inputType === 'button') {
+      console.log(`🔘 [버튼 클릭 감지] 톡톡챗봇 메뉴입니다. AI는 응대하지 않습니다.`);
+      return; 
+    }
+
+    // 2. !테스트 필터링 (실전 투입 시에는 이 두 줄을 지우시면 모든 고객에게 작동합니다)
     if (!userMessage.startsWith("!테스트")) return;
     const realMessage = userMessage.replace("!테스트 ", "");
 
+    // 3. 관리자 AI 스위치 확인
     if (!isAiActive) return; 
 
     const currentHour = new Date().getHours();
