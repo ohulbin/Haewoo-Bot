@@ -1,6 +1,7 @@
 const express = require('express');
 const { OpenAI } = require('openai');
 const basicAuth = require('express-basic-auth'); // 암호화 라이브러리
+const { createClient } = require('@supabase/supabase-js'); // ⭐️ Supabase 라이브러리 추가
 require('dotenv').config();
 
 const app = express();
@@ -11,6 +12,9 @@ app.use(express.urlencoded({ extended: true }));
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 const NAVER_AUTH_KEY = process.env.NAVER_AUTH_KEY;
 
+// ⭐️ Supabase 클라이언트 초기화
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_ANON_KEY);
+
 // ⭐️ 관리자 페이지 접속 암호 설정 (아이디: admin / 비밀번호: haewoo123!)
 app.use('/admin', basicAuth({
   users: { 'admin': 'haewoo123!' },
@@ -19,7 +23,7 @@ app.use('/admin', basicAuth({
 }));
 
 // ==========================================
-// ⚙️ 관리자 설정 변수
+// ⚙️ 관리자 설정 변수 (기본값 세팅)
 // ==========================================
 let isAiActive = true; 
 let activeStartHour = 19; 
@@ -57,11 +61,34 @@ let currentPrompt = `[해우렌탈 AI 야간 상담사]
 - 정책에 없는 내용은 지어내지(할루시네이션) 말고, 모르는 것은 내일 매니저에게 연결한다고 하세요.
 - 답변은 항상 존댓말을 사용하세요.`;
 
+// ⭐️ Supabase DB에서 최신 데이터 가져오는 함수
+async function loadSettingsFromDB() {
+  try {
+    const { data, error } = await supabase
+      .from('bot_settings')
+      .select('*')
+      .eq('id', 1)
+      .single();
+
+    if (error) throw error;
+
+    if (data) {
+      isAiActive = data.is_ai_active;
+      activeStartHour = data.active_start_hour;
+      activeEndHour = data.active_end_hour;
+      currentPrompt = data.current_prompt;
+      console.log('✅ Supabase로부터 최신 설정값을 로드했습니다.');
+    }
+  } catch (err) {
+    console.error('❌ DB 로드 실패 (기본 하드코딩 값으로 작동):', err.message);
+  }
+}
+
 // ⭐️ 1차 방어: 악성 유저 차단용 카운터
 const userRequestCount = {};
 
 // ==========================================
-// 🎨 [관리자 페이지 라우터] (상담 내역 제거)
+// 🎨 [관리자 페이지 라우터]
 // ==========================================
 app.get('/admin', (req, res) => {
   const html = `
@@ -137,13 +164,30 @@ app.get('/admin', (req, res) => {
   res.send(html);
 });
 
-app.post('/admin/update', (req, res) => {
+// ⭐️ 관리자 설정 변경 라우터 (업데이트 시 Supabase DB에 반영)
+app.post('/admin/update', async (req, res) => {
   isAiActive = req.body.isAiActiveToggle === 'on'; 
   activeStartHour = parseInt(req.body.activeStartHour);
   activeEndHour = parseInt(req.body.activeEndHour);
   currentPrompt = req.body.promptText;
   
-  console.log(`⚙️ 관리자 설정 변경 (상태: ${isAiActive ? 'ON' : 'OFF'})`);
+  try {
+    const { error } = await supabase
+      .from('bot_settings')
+      .update({
+        is_ai_active: isAiActive,
+        active_start_hour: activeStartHour,
+        active_end_hour: activeEndHour,
+        current_prompt: currentPrompt
+      })
+      .eq('id', 1);
+
+    if (error) throw error;
+    console.log(`⚙️ 관리자 설정 변경 및 Supabase DB 백업 완료 (상태: ${isAiActive ? 'ON' : 'OFF'})`);
+  } catch (err) {
+    console.error('❌ Supabase DB 업데이트 실패:', err.message);
+  }
+
   res.redirect('/admin'); 
 });
 
@@ -156,20 +200,17 @@ app.post('/webhook', async (req, res) => {
 
   if (event.event === 'send') {
     const userMessage = event.textContent.text; 
-    const inputType = event.textContent.inputType; // ⭐️ 추가: 입력 방식 추출
+    const inputType = event.textContent.inputType; 
     const userHash = event.user;
 
-    // ⭐️ 1. 톡톡챗봇 버튼 클릭 시 AI 무시 (네이버 기본 챗봇이 응대)
     if (inputType === 'button') {
       console.log(`🔘 [버튼 클릭 감지] 톡톡챗봇 메뉴입니다. AI는 응대하지 않습니다.`);
       return; 
     }
 
-    // 2. !테스트 필터링 (실전 투입 시에는 이 두 줄을 지우시면 모든 고객에게 작동합니다)
     if (!userMessage.startsWith("!테스트")) return;
     const realMessage = userMessage.replace("!테스트 ", "");
 
-    // 3. 관리자 AI 스위치 확인
     if (!isAiActive) return; 
 
     const currentHour = new Date().getHours();
@@ -182,13 +223,6 @@ app.post('/webhook', async (req, res) => {
     }
 
     if (!isTimeActive) return; 
-
-    // ⭐️ 1차 방어: 일일 질문 횟수 제한 (50회 이상 차단)
-    // userRequestCount[userHash] = (userRequestCount[userHash] || 0) + 1;
-    // if (userRequestCount[userHash] > 50) {
-    //   console.log(`🚨 [차단됨] 악용 의심 유저 감지: ${userHash}`);
-    //   return; 
-    // }
 
     try {
       const completion = await openai.chat.completions.create({
@@ -221,7 +255,11 @@ app.post('/webhook', async (req, res) => {
   }
 });
 
-app.listen(3000, () => {
+// ⭐️ 서버가 열릴 때 Supabase 로딩 함수 호출
+app.listen(3000, async () => {
+  console.log('==============================================');
   console.log('🚀 해우렌탈 최종 실전 서버 구동 중...');
+  await loadSettingsFromDB(); // ⭐️ DB 데이터 가져오기 실행
   console.log('👉 http://localhost:3000/admin (ID: admin / PW: haewoo123!)');
+  console.log('==============================================');
 });
